@@ -174,12 +174,18 @@ async function handleExternalCommand(tabId, rawUrl) {
   if (
     url.protocol !== "https:" ||
     !["bing.com", "www.bing.com"].includes(url.hostname) ||
-    !["/config", "/start"].includes(url.pathname)
+    !["/config", "/start", "/stop"].includes(url.pathname)
   ) {
     return;
   }
 
   try {
+    if (url.pathname === "/stop") {
+      await stopSearches();
+      console.log("External stop command applied");
+      return;
+    }
+
     const currentSettings = await loadSettings();
     const updatedSettings = readExternalSettings(url, currentSettings);
 
@@ -234,7 +240,7 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
     const isCommandUrl =
       url.protocol === "https:" &&
       ["bing.com", "www.bing.com"].includes(url.hostname) &&
-      ["/config", "/start"].includes(url.pathname);
+      ["/config", "/start", "/stop"].includes(url.pathname);
 
     if (isCommandUrl) {
       if (externalCommandTabs.has(tabId)) return;
@@ -248,7 +254,7 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
     if (
       url.protocol === "https:" &&
       ["bing.com", "www.bing.com"].includes(url.hostname) &&
-      ["/config", "/start"].includes(url.pathname)
+      ["/config", "/start", "/stop"].includes(url.pathname)
     ) {
       externalCommandTabs.delete(tabId);
     }
