@@ -169,15 +169,27 @@ function readExternalSettings(url, currentSettings) {
   return validateSettings({ ...currentSettings, ...updates });
 }
 
-async function handleExternalCommand(tabId, rawUrl) {
-  const url = new URL(rawUrl);
+function getExternalCommandUrl(rawUrl) {
+  const pageUrl = new URL(rawUrl);
   if (
-    url.protocol !== "https:" ||
-    !["bing.com", "www.bing.com"].includes(url.hostname) ||
-    !["/config", "/start", "/stop"].includes(url.pathname)
+    pageUrl.protocol !== "https:" ||
+    !["bing.com", "www.bing.com"].includes(pageUrl.hostname) ||
+    !pageUrl.hash.startsWith("#/")
   ) {
-    return;
+    return null;
   }
+
+  const commandUrl = new URL(pageUrl.hash.slice(1), pageUrl.origin);
+  if (!["/config", "/start", "/stop"].includes(commandUrl.pathname)) {
+    return null;
+  }
+
+  return commandUrl;
+}
+
+async function handleExternalCommand(tabId, rawUrl) {
+  const url = getExternalCommandUrl(rawUrl);
+  if (!url) return;
 
   try {
     if (url.pathname === "/stop") {
@@ -235,30 +247,21 @@ async function handleExternalCommand(tabId, rawUrl) {
 }
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
-  if (changeInfo.url) {
-    const url = new URL(changeInfo.url);
-    const isCommandUrl =
-      url.protocol === "https:" &&
-      ["bing.com", "www.bing.com"].includes(url.hostname) &&
-      ["/config", "/start", "/stop"].includes(url.pathname);
-
-    if (isCommandUrl) {
-      if (externalCommandTabs.has(tabId)) return;
-      externalCommandTabs.add(tabId);
-      handleExternalCommand(tabId, changeInfo.url);
-    } else {
-      externalCommandTabs.delete(tabId);
-    }
-  } else if (changeInfo.status === "complete" && tab.url) {
-    const url = new URL(tab.url);
-    if (
-      url.protocol === "https:" &&
-      ["bing.com", "www.bing.com"].includes(url.hostname) &&
-      ["/config", "/start", "/stop"].includes(url.pathname)
-    ) {
-      externalCommandTabs.delete(tabId);
-    }
+  if (changeInfo.status === "loading") {
+    externalCommandTabs.delete(tabId);
+    return;
   }
+
+  if (changeInfo.status !== "complete" && tab.status !== "complete") return;
+  const rawUrl = tab.url;
+  if (!rawUrl || !getExternalCommandUrl(rawUrl)) {
+    externalCommandTabs.delete(tabId);
+    return;
+  }
+
+  if (externalCommandTabs.has(tabId)) return;
+  externalCommandTabs.add(tabId);
+  handleExternalCommand(tabId, rawUrl);
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
