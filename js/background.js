@@ -103,6 +103,16 @@ let searchState = {
 };
 
 const ALARM_NAME = "searchAlarm";
+const DEFAULT_SETTINGS = {
+  desktopSearches: 3,
+  mobileSearches: 3,
+  millisecondsMin: 8000,
+  millisecondsMax: 10000,
+};
+
+const EXTERNAL_SETTING_KEYS = Object.keys(DEFAULT_SETTINGS);
+const externalCommandTabs = new Set();
+let isStartingSearches = false;
 
 // Save state to chrome.storage.local for persistence
 async function saveState() {
@@ -116,6 +126,138 @@ async function loadState() {
     searchState = result.searchState;
   }
 }
+
+async function loadSettings() {
+  const result = await chrome.storage.local.get("settings");
+  return { ...DEFAULT_SETTINGS, ...(result.settings || {}) };
+}
+
+function validateSettings(settings) {
+  const validated = {};
+
+  for (const key of EXTERNAL_SETTING_KEYS) {
+    const value = Number(settings[key]);
+    const minimum = key.startsWith("milliseconds") ? 100 : 1;
+    if (!Number.isSafeInteger(value) || value < minimum) {
+      throw new Error(`Invalid setting: ${key}`);
+    }
+    validated[key] = value;
+  }
+
+  if (validated.millisecondsMax < validated.millisecondsMin) {
+    throw new Error("Maximum delay must be greater than or equal to minimum delay");
+  }
+
+  return validated;
+}
+
+function readExternalSettings(url, currentSettings) {
+  const updates = {};
+  let hasSettings = false;
+
+  for (const key of EXTERNAL_SETTING_KEYS) {
+    if (!url.searchParams.has(key)) continue;
+    hasSettings = true;
+    const rawValue = url.searchParams.get(key);
+    if (!/^\d+$/.test(rawValue || "")) {
+      throw new Error(`Invalid value for setting: ${key}`);
+    }
+    updates[key] = Number(rawValue);
+  }
+
+  if (!hasSettings) return null;
+  return validateSettings({ ...currentSettings, ...updates });
+}
+
+async function handleExternalCommand(tabId, rawUrl) {
+  const url = new URL(rawUrl);
+  if (
+    url.protocol !== "https:" ||
+    !["bing.com", "www.bing.com"].includes(url.hostname) ||
+    !["/config", "/start"].includes(url.pathname)
+  ) {
+    return;
+  }
+
+  try {
+    const currentSettings = await loadSettings();
+    const updatedSettings = readExternalSettings(url, currentSettings);
+
+    if (url.pathname === "/config") {
+      if (!updatedSettings) {
+        throw new Error("The config URL must include at least one supported setting");
+      }
+      await chrome.storage.local.set({ settings: updatedSettings });
+      chrome.runtime.sendMessage({
+        type: "settingsUpdated",
+        settings: updatedSettings,
+      }).catch(() => {});
+      console.log("External settings applied");
+      return;
+    }
+
+    const mode = url.searchParams.get("mode");
+    const searchType =
+      mode === "desktop" || mode === "mobile"
+        ? mode
+        : mode === "both"
+          ? "desktopMobile"
+          : null;
+
+    if (!searchType) {
+      throw new Error(
+        "The start URL must include mode=desktop, mode=mobile, or mode=both",
+      );
+    }
+
+    const settings = updatedSettings || validateSettings(currentSettings);
+    if (updatedSettings) {
+      await chrome.storage.local.set({ settings: updatedSettings });
+      chrome.runtime.sendMessage({
+        type: "settingsUpdated",
+        settings: updatedSettings,
+      }).catch(() => {});
+    }
+
+    const result = await startSearches(searchType, settings, tabId);
+    if (!result.success) {
+      throw new Error(result.error);
+    }
+  } catch (error) {
+    console.error("Unable to process external command:", error);
+  }
+}
+
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (changeInfo.url) {
+    const url = new URL(changeInfo.url);
+    const isCommandUrl =
+      url.protocol === "https:" &&
+      ["bing.com", "www.bing.com"].includes(url.hostname) &&
+      ["/config", "/start"].includes(url.pathname);
+
+    if (isCommandUrl) {
+      if (externalCommandTabs.has(tabId)) return;
+      externalCommandTabs.add(tabId);
+      handleExternalCommand(tabId, changeInfo.url);
+    } else {
+      externalCommandTabs.delete(tabId);
+    }
+  } else if (changeInfo.status === "complete" && tab.url) {
+    const url = new URL(tab.url);
+    if (
+      url.protocol === "https:" &&
+      ["bing.com", "www.bing.com"].includes(url.hostname) &&
+      ["/config", "/start"].includes(url.pathname)
+    ) {
+      externalCommandTabs.delete(tabId);
+    }
+  }
+});
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  externalCommandTabs.delete(tabId);
+});
 
 // Helper functions
 function getRandomSearchWord() {
@@ -467,38 +609,49 @@ async function stopSearches() {
 }
 
 // Start searches
-async function startSearches(type, settings) {
-  if (searchState.isRunning) {
+async function startSearches(type, settings, requestedTabId) {
+  if (searchState.isRunning || isStartingSearches) {
     return { success: false, error: "Searches already running" };
   }
 
-  const tabId = await getTabId();
-
-  searchState = {
-    isRunning: true,
-    currentSearch: 0,
-    totalSearches:
-      type === "mobile" ? settings.mobileSearches : settings.desktopSearches,
-    tabId: tabId,
-    searchType: type,
-    phase: type === "mobile" ? "mobile" : "desktop",
-    millisecondsMin: settings.millisecondsMin,
-    millisecondsMax: settings.millisecondsMax,
-    desktopSearches: settings.desktopSearches,
-    mobileSearches: settings.mobileSearches,
-  };
-
-  // Initialize mobile mode if needed
-  if (type === "mobile") {
-    await enableDebugger(tabId);
-    await activeMobileAgent(tabId);
+  try {
+    settings = validateSettings(settings);
+  } catch (error) {
+    return { success: false, error: error.message };
   }
 
-  // Save state and start the first search
-  await saveState();
-  performSingleSearch();
+  isStartingSearches = true;
+  try {
+    const tabId = requestedTabId || (await getTabId());
 
-  return { success: true };
+    searchState = {
+      isRunning: true,
+      currentSearch: 0,
+      totalSearches:
+        type === "mobile" ? settings.mobileSearches : settings.desktopSearches,
+      tabId: tabId,
+      searchType: type,
+      phase: type === "mobile" ? "mobile" : "desktop",
+      millisecondsMin: settings.millisecondsMin,
+      millisecondsMax: settings.millisecondsMax,
+      desktopSearches: settings.desktopSearches,
+      mobileSearches: settings.mobileSearches,
+    };
+
+    // Initialize mobile mode if needed
+    if (type === "mobile") {
+      await enableDebugger(tabId);
+      await activeMobileAgent(tabId);
+    }
+
+    // Save state and start the first search
+    await saveState();
+    performSingleSearch();
+
+    return { success: true };
+  } finally {
+    isStartingSearches = false;
+  }
 }
 
 // Alarm listener - this fires even when popup is closed
@@ -535,6 +688,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       sendResponse(result);
     });
     return true; // Indicates async response
+  }
+
+  if (message.type === "saveSettings") {
+    try {
+      const settings = validateSettings(message.settings);
+      chrome.storage.local.set({ settings }).then(() => {
+        sendResponse({ success: true, settings });
+      });
+    } catch (error) {
+      sendResponse({ success: false, error: error.message });
+    }
+    return true;
   }
 
   if (message.type === "stopSearches") {
